@@ -1,0 +1,106 @@
+--- a/OptiScaler/upscalers/dlss/DLSSTiling.h
++++ b/OptiScaler/upscalers/dlss/DLSSTiling.h
+@@ -66,7 +66,7 @@
+ {
+     outTiles.clear();
+ 
+-    if (tileCount <= 1)
++    if (tileCount <= 1 || renderW < tileCount || outW < tileCount)
+         return false;
+     if (renderW % tileCount != 0 || outW % tileCount != 0)
+         return false;
+--- a/OptiScaler/upscalers/dlss/DLSSFeature_Dx11.cpp
++++ b/OptiScaler/upscalers/dlss/DLSSFeature_Dx11.cpp
+@@ -160,6 +160,21 @@
+ 
+     if (!_tileHandles.empty())
+     {
++        // The handles retain their output size and temporal history, but DRS
++        // can change the active input size on every frame. Never reuse the
++        // input offsets/widths calculated when the handles were created.
++        std::vector<DLSSTile> frameTiles;
++        if (RenderHeight() == 0 ||
++            !DLSSTiling::BuildTiles(RenderWidth(), TargetWidth(),
++                                    static_cast<unsigned int>(_tileHandles.size()), frameTiles))
++        {
++            // Reject before evaluating any tile: rounding the input split
++            // would give the tiles different scale ratios at their seams.
++            LOG_ERROR("Tiled DLSS cannot split current render {}x{} -> target {}x{} into {} equal tiles",
++                      RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), _tileHandles.size());
++            return false;
++        }
++
+         // One evaluate per tile, all reading the same untouched full-frame
+         // color / depth / motion-vector textures. Because the subrect is in the
+         // same coordinate space as the original frame, MV.Scale.X/Y stay as the
+@@ -169,7 +184,7 @@
+ 
+         for (size_t i = 0; i < _tileHandles.size(); i++)
+         {
+-            DLSSTiling::ApplyTile(InParameters, backup, _tiles[i], RenderHeight(), LowResMV());
++            DLSSTiling::ApplyTile(InParameters, backup, frameTiles[i], RenderHeight(), LowResMV());
+ 
+             nvResult = NVNGXProxy::D3D11_EvaluateFeature()(InDeviceContext, _tileHandles[i], InParameters, NULL);
+ 
+--- a/OptiScaler/upscalers/dlss/DLSSFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/dlss/DLSSFeature_Dx12.cpp
+@@ -69,6 +69,8 @@
+         // Must be set at create time or the output subrect base is ignored.
+         InParameters->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 1);
+ 
++        bool tilesOk = true;
++
+         for (size_t i = 0; i < _tiles.size(); i++)
+         {
+             // Each feature is sized to its tile, not to the whole frame.
+@@ -95,7 +97,8 @@
+ 
+                 _tileHandles.clear();
+                 _tiles.clear();
+-                return false;
++                tilesOk = false;
++                break;
+             }
+ 
+             LOG_INFO("_CreateFeature tile {} ({}px wide): Success", i, _tiles[i].outW);
+@@ -108,6 +111,9 @@
+         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, TargetWidth());
+         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, TargetHeight());
+ 
++        if (!tilesOk)
++            return false;
++
+         _p_dlssHandle = _tileHandles[0];
+     }
+     else
+@@ -157,6 +163,21 @@
+ 
+     if (!_tileHandles.empty())
+     {
++        // The handles retain their output size and temporal history, but DRS
++        // can change the active input size on every frame. Never reuse the
++        // input offsets/widths calculated when the handles were created.
++        std::vector<DLSSTile> frameTiles;
++        if (RenderHeight() == 0 ||
++            !DLSSTiling::BuildTiles(RenderWidth(), TargetWidth(),
++                                    static_cast<unsigned int>(_tileHandles.size()), frameTiles))
++        {
++            // Reject before evaluating any tile: rounding the input split
++            // would give the tiles different scale ratios at their seams.
++            LOG_ERROR("Tiled DLSS cannot split current render {}x{} -> target {}x{} into {} equal tiles",
++                      RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight(), _tileHandles.size());
++            return false;
++        }
++
+         // One evaluate per tile, all reading the same untouched full-frame
+         // color / depth / motion-vector textures. Because the subrect is in the
+         // same coordinate space as the original frame, MV.Scale.X/Y stay as the
+@@ -166,7 +187,7 @@
+ 
+         for (size_t i = 0; i < _tileHandles.size(); i++)
+         {
+-            DLSSTiling::ApplyTile(InParameters, backup, _tiles[i], RenderHeight(), LowResMV());
++            DLSSTiling::ApplyTile(InParameters, backup, frameTiles[i], RenderHeight(), LowResMV());
+ 
+             nvResult = NVNGXProxy::D3D12_EvaluateFeature()(InCommandList, _tileHandles[i], InParameters, NULL);
+ 

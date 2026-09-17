@@ -3,10 +3,15 @@
 #include <upscalers/IFeature_Dx12.h>
 #include <shaders/rcas/RCAS_Dx12.h>
 #include <string>
+#include <wrl/client.h>
 
 class DLSSFeatureDx12 : public DLSSFeature, public IFeature_Dx12
 {
   private:
+    // Retain old formats until feature destruction: submitted GPU work may
+    // still use them. DRS alone never allocates another output texture.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> _cropOutputs;
+    ID3D12Resource* CropOutput(ID3D12Resource* output, unsigned int width, unsigned int height);
   protected:
     bool InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
 

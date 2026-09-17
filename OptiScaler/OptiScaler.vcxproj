@@ -859,4 +859,14 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <Target Name="CopyDxgiDll" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <PropertyGroup>
+      <_DxgiCopyDirectory>$(TargetDir)</_DxgiCopyDirectory>
+      <!-- Release packaging moves the linked DLL into the deployment folder. -->
+      <_DxgiCopyDirectory Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">$(SolutionDir)x64\Release\a\</_DxgiCopyDirectory>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_DxgiCopyDirectory)$(TargetFileName)"
+          DestinationFiles="$(_DxgiCopyDirectory)dxgi.dll"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

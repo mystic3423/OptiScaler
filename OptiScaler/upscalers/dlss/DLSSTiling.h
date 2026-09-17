@@ -9,17 +9,15 @@
 // point each at a horizontal subrect of the SAME game-supplied color / depth /
 // motion-vector textures, writing into subrects of the SAME output texture.
 //
-// No tile copies and no scratch allocations: NGX's subrect parameters do the
-// addressing. Because every tile reads the untouched full-frame resources, the
-// motion vectors stay in the full-frame coordinate space, so MV.Scale.X/Y are
-// passed through unchanged.
-//
-// Phase 1 is a hard split with zero overlap. Tiles are aligned to physical
-// monitor boundaries so each seam falls behind a bezel.
+// Divisible inputs use subrect addressing without copies or scratch buffers.
+// Uneven widths use experimental expanded tiles and integer-cropped copies.
+// MV.Scale.X/Y stay in the game's pixel-displacement units in both paths.
 // -----------------------------------------------------------------------------
 
 #include <vector>
 #include <cstdlib>
+#include <algorithm>
+#include <cstdint>
 #include <Windows.h>
 
 // Self-sufficient: don't rely on DLSSFeature.h's include order.
@@ -33,6 +31,9 @@ struct DLSSTile
     unsigned int renderW;
     unsigned int outX;     // subrect base X into the game's output texture
     unsigned int outW;
+    unsigned int evalOutW; // expanded DLSS output width; outW is the final copy width
+    unsigned int cropX;
+    unsigned int mvX;      // expanded origin in display-resolution MV space
 };
 
 namespace DLSSTiling
@@ -66,7 +67,7 @@ inline bool BuildTiles(unsigned int renderW, unsigned int outW, unsigned int til
 {
     outTiles.clear();
 
-    if (tileCount <= 1)
+    if (tileCount <= 1 || renderW < tileCount || outW < tileCount || renderW > 16384 || outW > 16384)
         return false;
     if (renderW % tileCount != 0 || outW % tileCount != 0)
         return false;
@@ -75,8 +76,55 @@ inline bool BuildTiles(unsigned int renderW, unsigned int outW, unsigned int til
     const unsigned int tileOutW = outW / tileCount;
 
     for (unsigned int i = 0; i < tileCount; i++)
-        outTiles.push_back({ tileRenderW * i, tileRenderW, tileOutW * i, tileOutW });
+        outTiles.push_back({ tileRenderW * i, tileRenderW, tileOutW * i, tileOutW,
+                             tileOutW, 0, tileOutW * i });
 
+    return true;
+}
+
+// Experimental integer crop, only for uneven input widths. All expanded tiles
+// use the same scale. The outer tiles anchor to the frame edges; the middle
+// crop rounds to the nearest output pixel. This approximates fractional
+// boundaries and is deliberately not an exact resampling solution.
+inline bool BuildFrameTiles(unsigned int renderW, unsigned int outW, unsigned int tileCount,
+                            std::vector<DLSSTile>& tiles)
+{
+    if (BuildTiles(renderW, outW, tileCount, tiles))
+        return true;
+    if (tileCount <= 1 || renderW < tileCount || outW < tileCount || renderW > 16384 || outW > 16384 ||
+        outW % tileCount != 0)
+        return false;
+
+    constexpr unsigned int padding = 16;
+    const unsigned int finalW = outW / tileCount;
+    if (finalW > 8192 - padding)
+        return false;
+    const unsigned int expandedW = finalW + padding;
+    if (expandedW > outW)
+        return false;
+    const auto r = static_cast<uint64_t>(renderW);
+    const unsigned int inputW = static_cast<unsigned int>((r * expandedW + outW - 1) / outW);
+    if (inputW > renderW)
+        return false;
+
+    for (unsigned int i = 0; i < tileCount; ++i)
+    {
+        const unsigned int x = finalW * i;
+        const unsigned int idealStart = x > padding / 2 ? x - padding / 2 : 0;
+        const unsigned int inputX = (std::min)(static_cast<unsigned int>(r * idealStart / outW), renderW - inputW);
+        // Distance from expanded input origin to the ideal full-frame boundary.
+        const uint64_t delta = r * x - static_cast<uint64_t>(inputX) * outW;
+        const uint64_t denominator = static_cast<uint64_t>(outW) * inputW;
+        unsigned int crop = (std::min)(padding, static_cast<unsigned int>(
+            (delta * expandedW + denominator / 2) / denominator));
+        if (i == 0)
+            crop = 0;
+        else if (i == tileCount - 1)
+            crop = padding;
+        const unsigned int mvX = (std::min)(outW - expandedW, static_cast<unsigned int>(
+            (static_cast<uint64_t>(inputX) * outW + renderW / 2) / renderW));
+        tiles.push_back({ inputX, inputW, x, finalW, expandedW, crop, mvX });
+    }
     return true;
 }
 
@@ -127,6 +175,8 @@ struct SubrectBackup
 {
     unsigned int inX[kInputSubrectCount] = {};
     unsigned int outX = 0;
+    unsigned int outY = 0;
+    int reset = 0;
     unsigned int subW = 0, subH = 0;
     bool hadSubDims = false;
 };
@@ -143,6 +193,8 @@ inline void Save(NVSDK_NGX_Parameter* p, SubrectBackup& b)
 
     if (p->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, &b.outX) != NVSDK_NGX_Result_Success)
         b.outX = 0;
+    p->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, &b.outY);
+    p->Get(NVSDK_NGX_Parameter_Reset, &b.reset);
 
     b.hadSubDims = p->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &b.subW) ==
                        NVSDK_NGX_Result_Success &&
@@ -170,6 +222,8 @@ inline void Restore(NVSDK_NGX_Parameter* p, const SubrectBackup& b)
         p->Set(kInputSubrects[i].name, b.inX[i]);
 
     p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, b.outX);
+    p->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, b.outY);
+    p->Set(NVSDK_NGX_Parameter_Reset, b.reset);
 
     // Unconditional: see the note in Save(). Skipping this is what let a tile's
     // dimensions leak into the next feature creation.
@@ -190,7 +244,7 @@ inline void Restore(NVSDK_NGX_Parameter* p, const SubrectBackup& b)
 inline void ApplyTile(NVSDK_NGX_Parameter* p, const SubrectBackup& base, const DLSSTile& t, unsigned int renderH,
                       bool lowResMV)
 {
-    const unsigned int mvOffset = lowResMV ? t.renderX : t.outX;
+    const unsigned int mvOffset = lowResMV ? t.renderX : t.mvX;
 
     for (size_t i = 0; i < kInputSubrectCount; i++)
         p->Set(kInputSubrects[i].name, base.inX[i] + (kInputSubrects[i].isMotionVector ? mvOffset : t.renderX));
@@ -200,4 +254,26 @@ inline void ApplyTile(NVSDK_NGX_Parameter* p, const SubrectBackup& base, const D
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, t.renderW);
     p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, renderH);
 }
+
+// Both APIs restore the caller's output resource and parameters on every return.
+template <typename Resource> class EvaluationScope
+{
+    NVSDK_NGX_Parameter* _params;
+
+  public:
+    SubrectBackup base;
+    Resource* output = nullptr;
+    explicit EvaluationScope(NVSDK_NGX_Parameter* p) : _params(p)
+    {
+        Save(p, base);
+        p->Get(NVSDK_NGX_Parameter_Output, &output);
+    }
+    ~EvaluationScope()
+    {
+        Restore(_params, base);
+        _params->Set(NVSDK_NGX_Parameter_Output, output);
+    }
+    EvaluationScope(const EvaluationScope&) = delete;
+    EvaluationScope& operator=(const EvaluationScope&) = delete;
+};
 } // namespace DLSSTiling

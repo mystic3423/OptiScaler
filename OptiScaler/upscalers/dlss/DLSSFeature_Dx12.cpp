@@ -3,6 +3,41 @@
 #include <dxgi1_4.h>
 #include <Config.h>
 
+ID3D12Resource* DLSSFeatureDx12::CropOutput(ID3D12Resource* output, unsigned int width, unsigned int height)
+{
+    const auto original = output->GetDesc();
+    for (const auto& cached : _cropOutputs)
+    {
+        const auto desc = cached->GetDesc();
+        if (desc.Width == width && desc.Height == height && desc.Format == original.Format)
+            return cached.Get();
+    }
+    D3D12_RESOURCE_DESC desc {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = original.Format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+    Microsoft::WRL::ComPtr<ID3D12Resource> scratch;
+    const auto result = Device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&scratch));
+    if (FAILED(result))
+    {
+        LOG_ERROR("Integer-crop DLSS output allocation failed: {:X}", (unsigned int) result);
+        return nullptr;
+    }
+    _cropOutputs.push_back(scratch);
+    return scratch.Get();
+}
+
 bool DLSSFeatureDx12::InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
 {
     if (IsInited())
@@ -47,17 +82,20 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
 
     ProcessInitParams(InParameters);
 
-    // ---- split-frame tiling -------------------------------------------------
-    // DLSS SR on D3D12 rejects an output width above 8192. Create one feature
-    // per tile instead, each narrow enough to pass, and let NGX subrects do the
-    // addressing into the game's full-frame textures at evaluate time.
+    _tileOutputHeight = TargetHeight();
+    InParameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &_tileCreateFlags);
+    InParameters->Get(NVSDK_NGX_Parameter_PerfQualityValue, &_tileQuality);
+
+    // Create the direct-output set at nominal integer dimensions. On an
+    // uneven first frame this set is retained for later divisible frames;
+    // evaluation creates the expanded set and uses the full active input.
     const unsigned int tileCount = DLSSTiling::TileCountFromEnv();
     _tiles.clear();
     _tileHandles.clear();
 
-    if (tileCount > 1 && !DLSSTiling::BuildTiles(RenderWidth(), TargetWidth(), tileCount, _tiles))
+    if (tileCount > 1 && !DLSSTiling::BuildTiles((RenderWidth() / tileCount) * tileCount, TargetWidth(), tileCount, _tiles))
     {
-        LOG_ERROR("Tiling requested ({} tiles) but {}x -> {}x does not divide evenly; falling back to single feature",
+        LOG_ERROR("Tiling requested ({} tiles) but {}x -> {}x cannot form a valid output layout; falling back to single feature",
                   tileCount, RenderWidth(), TargetWidth());
     }
 
@@ -68,6 +106,8 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
 
         // Must be set at create time or the output subrect base is ignored.
         InParameters->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 1);
+
+        bool tilesOk = true;
 
         for (size_t i = 0; i < _tiles.size(); i++)
         {
@@ -95,7 +135,8 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
 
                 _tileHandles.clear();
                 _tiles.clear();
-                return false;
+                tilesOk = false;
+                break;
             }
 
             LOG_INFO("_CreateFeature tile {} ({}px wide): Success", i, _tiles[i].outW);
@@ -107,6 +148,9 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
         InParameters->Set(NVSDK_NGX_Parameter_Height, RenderHeight());
         InParameters->Set(NVSDK_NGX_Parameter_OutWidth, TargetWidth());
         InParameters->Set(NVSDK_NGX_Parameter_OutHeight, TargetHeight());
+
+        if (!tilesOk)
+            return false;
 
         _p_dlssHandle = _tileHandles[0];
     }
@@ -157,29 +201,92 @@ bool DLSSFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
 
     if (!_tileHandles.empty())
     {
-        // One evaluate per tile, all reading the same untouched full-frame
-        // color / depth / motion-vector textures. Because the subrect is in the
-        // same coordinate space as the original frame, MV.Scale.X/Y stay as the
-        // game set them - no per-tile rescaling.
-        DLSSTiling::SubrectBackup backup;
-        DLSSTiling::Save(InParameters, backup);
-
-        for (size_t i = 0; i < _tileHandles.size(); i++)
-        //for (size_t i = 0; i < 1; i++)
+        const bool previousValid = _tileHistoryValid;
+        _tileHistoryValid = false; // Any early return forces a reset on the next complete frame.
+        std::vector<DLSSTile> frameTiles;
+        if (RenderHeight() == 0 || TargetHeight() != _tileOutputHeight ||
+            TargetWidth() != _tiles[0].outW * _tileHandles.size() ||
+            !DLSSTiling::BuildFrameTiles(RenderWidth(), TargetWidth(),
+                                        static_cast<unsigned int>(_tileHandles.size()), frameTiles))
         {
-            DLSSTiling::ApplyTile(InParameters, backup, _tiles[i], RenderHeight());
+            LOG_ERROR("Invalid current tiled DLSS geometry: {}x{} -> {}x{}",
+                      RenderWidth(), RenderHeight(), TargetWidth(), TargetHeight());
+            return false;
+        }
 
-            nvResult = NVNGXProxy::D3D12_EvaluateFeature()(InCommandList, _tileHandles[i], InParameters, NULL);
+        const bool cropped = frameTiles[0].evalOutW != frameTiles[0].outW;
+        const bool reset = !previousValid || cropped != _lastTilesCropped ||
+                           (cropped && (RenderWidth() != _lastTileRenderW || RenderHeight() != _lastTileRenderH));
+        DLSSTiling::EvaluationScope<ID3D12Resource> scope(InParameters);
+        ID3D12Resource* scratch = nullptr;
+        if (cropped)
+        {
+            if (scope.output == nullptr)
+                return false;
+            const auto desc = scope.output->GetDesc();
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+                desc.SampleDesc.Count != 1 || desc.MipLevels != 1)
+                return false;
+            if (static_cast<uint64_t>(scope.base.outX) + TargetWidth() > desc.Width ||
+                static_cast<uint64_t>(scope.base.outY) + TargetHeight() > desc.Height)
+            {
+                LOG_ERROR("Integer-crop DLSS destination subrect exceeds output texture");
+                return false;
+            }
+            scratch = CropOutput(scope.output, frameTiles[0].evalOutW, TargetHeight());
+            if (scratch == nullptr)
+                return false;
+            if (!EnsureCroppedTileHandles(InParameters, frameTiles, [&](NVSDK_NGX_Handle** handle) {
+                ScopedSkipHeapCapture skipHeapCapture {};
+                return NVNGXProxy::D3D12_CreateFeature()(InCommandList, NVSDK_NGX_Feature_SuperSampling,
+                                                          InParameters, handle);
+            }, [](NVSDK_NGX_Handle* handle) { NVNGXProxy::D3D12_ReleaseFeature()(handle); }))
+                return false;
+        }
 
+        const auto& handles = cropped ? _croppedTileHandles : _tileHandles;
+        for (size_t i = 0; i < handles.size(); ++i)
+        {
+            const auto& tile = frameTiles[i];
+            DLSSTiling::ApplyTile(InParameters, scope.base, tile, RenderHeight(), LowResMV());
+            InParameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : scope.base.reset);
+            if (cropped)
+            {
+                InParameters->Set(NVSDK_NGX_Parameter_Output, static_cast<ID3D12Resource*>(scratch));
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, 0u);
+                InParameters->Set(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, 0u);
+            }
+            nvResult = NVNGXProxy::D3D12_EvaluateFeature()(InCommandList, handles[i], InParameters, nullptr);
             if (nvResult != NVSDK_NGX_Result_Success)
             {
                 LOG_ERROR("_EvaluateFeature tile {} result: {:X}", i, (unsigned int) nvResult);
-                DLSSTiling::Restore(InParameters, backup);
                 return false;
             }
+            if (cropped)
+            {
+                // NGX output is UAV, as in the existing postprocessing path.
+                ResourceBarrier(InCommandList, scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                ResourceBarrier(InCommandList, scope.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION source {}, destination {};
+                source.pResource = scratch;
+                source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                destination.pResource = scope.output;
+                destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                const D3D12_BOX box { tile.cropX, 0, 0, tile.cropX + tile.outW, TargetHeight(), 1 };
+                InCommandList->CopyTextureRegion(&destination, scope.base.outX + tile.outX,
+                                                scope.base.outY, 0, &source, &box);
+                ResourceBarrier(InCommandList, scope.output, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                ResourceBarrier(InCommandList, scratch, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
         }
-
-        DLSSTiling::Restore(InParameters, backup);
+        _lastTilesCropped = cropped;
+        _lastTileRenderW = RenderWidth();
+        _lastTileRenderH = RenderHeight();
+        _tileHistoryValid = true;
     }
     else
     {
@@ -229,6 +336,11 @@ DLSSFeatureDx12::~DLSSFeatureDx12()
 
     if (NVNGXProxy::D3D12_ReleaseFeature() == nullptr)
         return;
+
+    for (auto* handle : _croppedTileHandles)
+        if (handle != nullptr)
+            NVNGXProxy::D3D12_ReleaseFeature()(handle);
+    _croppedTileHandles.clear();
 
     if (!_tileHandles.empty())
     {
