@@ -156,6 +156,22 @@ the OptiScaler cap is 116. Disabling DOF did not fix it. The owner suspects a
 tiling regression, but the cause is unconfirmed. Limiter isolation and a controlled
 tiling comparison are pending. Resume when the owner is ready.
 
+### Trails in the Sky 2nd Chapter: motion blur and secondary DLAA pass
+
+See [the Trails investigation note](docs/investigations/trails-sky-motion-blur.md).
+The owner reports blur during slow pans. An older-build log shows a main
+5760 x 1080 -> 11520 x 2160 DX11 feature and a separate 1536 x 1536 feature,
+both tiled. The owner suspects the square feature is the map's optional DLAA;
+this is unconfirmed. In a follow-up session with map DLAA off, the owner reports
+normal motion and the square pass is absent from the log. The Performance to
+Quality switch successfully recreates all three tiles and changes evaluated
+input from 5760 x 1080 to 7680 x 1440, retaining 11520 x 2160 output and
+`LowResMV: true`. Actual MV scales/texture sampling remain unverified; map DLAA
+as the blur's cause still needs an on/off comparison. Proposed
+future handling: decide tiling per feature and keep outputs within the reported
+dimension bound on the ordinary single-feature path. Preserve three tiles for
+the main Surround output. No secondary-pass fix or GPU validation is done yet.
+
 ## Collaboration preferences
 
 - The owner builds/debugs with Visual Studio 2022 and may use VS Code's Codex
