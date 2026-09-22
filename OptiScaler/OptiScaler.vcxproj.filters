@@ -125,9 +125,6 @@
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx12.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="upscalers\dlssd\DLSSDTiling.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>

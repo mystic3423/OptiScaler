@@ -505,7 +505,6 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\dlssd\DLSSDFeature.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx11.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Dx12.h" />
-    <ClInclude Include="upscalers\dlssd\DLSSDTiling.h" />
     <ClInclude Include="upscalers\dlssd\DLSSDFeature_Vk.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature.h" />
     <ClInclude Include="upscalers\dlss\DLSSFeature_Dx11.h" />

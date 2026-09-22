@@ -88,8 +88,7 @@ bool DLSSFeatureDx11::InitInternal(ID3D11DeviceContext* InContext, NVSDK_NGX_Par
         // Create the direct-output set at nominal integer dimensions. On an
         // uneven first frame this set is retained for later divisible frames;
         // evaluation creates the expanded set and uses the full active input.
-        // Keep ordinary-sized outputs on the single-feature path.
-        const unsigned int tileCount = TargetWidth() < 8192 ? 1 : DLSSTiling::TileCountFromEnv();
+        const unsigned int tileCount = DLSSTiling::TileCountFromEnv();
         _tiles.clear();
         _tileHandles.clear();
 

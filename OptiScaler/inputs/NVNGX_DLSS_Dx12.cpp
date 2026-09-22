@@ -1011,23 +1011,6 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
     {
         UpscalerInputsDx12::Reset();
 
-        // Configuration calls both NVIDIA backends "DLSS". Select the actual
-        // feature from this game handle's original request, including after an
-        // FSR fallback and during resolution-driven recreation.
-        if (ctxData.changeBackendCounter == 0)
-        {
-            const auto requested = state.newBackend == Upscaler::Reset ? cfg.Dx12Upscaler.value_or_default()
-                                                                       : state.newBackend;
-            const auto original = HandleToFeature.find(handleId);
-            if ((requested == Upscaler::DLSS || requested == Upscaler::DLSSD) && original != HandleToFeature.end())
-            {
-                state.newBackend = original->second == NVSDK_NGX_Feature_RayReconstruction ? Upscaler::DLSSD
-                                                                                         : Upscaler::DLSS;
-                LOG_INFO("NVIDIA backend selected from original feature {} for handle {}: {}",
-                         static_cast<unsigned int>(original->second), handleId, UpscalerDisplayName(state.newBackend));
-            }
-        }
-
         auto successfulPhase = FeatureProvider_Dx12::ChangeFeature(state.newBackend, D3D12Device, InCmdList, handleId,
                                                                    InParameters, &ctxData);
         feature = ctxData.feature.get();
