@@ -62,6 +62,8 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
         }
         else
         {
+            LOG_WARN("RR backend unavailable: OptiHandle={} dlssCapable={} DLSSDPathPresent={}; falling back to FSR 2.1.2",
+                     handleId, primaryGpu.dlssCapable, state.NVNGX_DLSSD_Path.has_value());
             *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
             upscaler = Upscaler::FSR21;
             break;
