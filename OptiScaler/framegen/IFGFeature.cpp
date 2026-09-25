@@ -239,6 +239,30 @@ void IFGFeature::SetCameraData(float cameraPosition[3], float cameraUp[3], float
     std::memcpy(_cameraForward[index], cameraForward, 3 * sizeof(float));
 }
 
+void IFGFeature::SetCameraMatrices(const float cameraViewToClip[4][4], const float clipToCameraView[4][4],
+                                   const float clipToLensClip[4][4], const float clipToPrevClip[4][4],
+                                   const float prevClipToClip[4][4], const float cameraPinholeOffset[2], int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    std::memcpy(_cameraViewToClip[index], cameraViewToClip, sizeof(_cameraViewToClip[index]));
+    std::memcpy(_clipToCameraView[index], clipToCameraView, sizeof(_clipToCameraView[index]));
+    std::memcpy(_clipToLensClip[index], clipToLensClip, sizeof(_clipToLensClip[index]));
+    std::memcpy(_clipToPrevClip[index], clipToPrevClip, sizeof(_clipToPrevClip[index]));
+    std::memcpy(_prevClipToClip[index], prevClipToClip, sizeof(_prevClipToClip[index]));
+    std::memcpy(_cameraPinholeOffset[index], cameraPinholeOffset, sizeof(_cameraPinholeOffset[index]));
+    _haveCameraMatrices[index] = true;
+}
+
+void IFGFeature::ClearCameraMatrices(int index)
+{
+    if (index < 0)
+        index = GetIndex();
+
+    _haveCameraMatrices[index] = false;
+}
+
 void IFGFeature::SetFrameTimeDelta(double delta, int index)
 {
     if (index < 0)

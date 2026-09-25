@@ -237,6 +237,71 @@ bool Sl_Inputs_Dx12::setConstants(const sl::Constants& values, uint32_t frameId)
         fgOutput->SetCameraData(reinterpret_cast<float*>(&data.cameraPos), reinterpret_cast<float*>(&data.cameraUp),
                                 reinterpret_cast<float*>(&data.cameraRight), reinterpret_cast<float*>(&data.cameraFwd));
 
+        // Keep the game's own camera matrices so outputs that understand them (DLSSG) can
+        // forward them instead of synthesising or leaving them empty. Skipped for engines
+        // and games already known to send broken projections (see loadCameraMatrix above).
+        {
+            auto isFiniteNonZero = [](const sl::float4x4& m)
+            {
+                const float* f = reinterpret_cast<const float*>(&m);
+                bool nonZero = false;
+
+                for (int i = 0; i < 16; i++)
+                {
+                    if (!std::isfinite(f[i]))
+                        return false;
+
+                    nonZero |= f[i] != 0.0f;
+                }
+
+                return nonZero;
+            };
+
+            auto isIdentity = [](const sl::float4x4& m)
+            {
+                const float* f = reinterpret_cast<const float*>(&m);
+
+                for (int i = 0; i < 16; i++)
+                {
+                    if (f[i] != ((i % 5 == 0) ? 1.0f : 0.0f))
+                        return false;
+                }
+
+                return true;
+            };
+
+            const bool matricesUsable = engineType != sl::EngineType::eUnreal && !dontRecalc &&
+                                        data.orthographicProjection != sl::Boolean::eTrue &&
+                                        isFiniteNonZero(data.cameraViewToClip) && !isIdentity(data.cameraViewToClip) &&
+                                        isFiniteNonZero(data.clipToCameraView) &&
+                                        isFiniteNonZero(data.clipToPrevClip) && isFiniteNonZero(data.prevClipToClip);
+
+            if (matricesUsable)
+            {
+                // clipToLensClip is optional; an empty one means no lens distortion
+                sl::float4x4 lensClip = data.clipToLensClip;
+                if (!isFiniteNonZero(lensClip))
+                {
+                    std::memset(&lensClip, 0, sizeof(lensClip));
+                    lensClip.row[0].x = lensClip.row[1].y = lensClip.row[2].z = lensClip.row[3].w = 1.0f;
+                }
+
+                float pinhole[2] = { data.cameraPinholeOffset.x, data.cameraPinholeOffset.y };
+                if (!std::isfinite(pinhole[0]) || !std::isfinite(pinhole[1]))
+                    pinhole[0] = pinhole[1] = 0.0f;
+
+                fgOutput->SetCameraMatrices(reinterpret_cast<const float(*)[4]>(&data.cameraViewToClip),
+                                            reinterpret_cast<const float(*)[4]>(&data.clipToCameraView),
+                                            reinterpret_cast<const float(*)[4]>(&lensClip),
+                                            reinterpret_cast<const float(*)[4]>(&data.clipToPrevClip),
+                                            reinterpret_cast<const float(*)[4]>(&data.prevClipToClip), pinhole);
+            }
+            else
+            {
+                fgOutput->ClearCameraMatrices();
+            }
+        }
+
         fgOutput->SetReset(data.reset == sl::Boolean::eTrue);
 
         fgOutput->SetFrameTimeDelta(static_cast<float>(State::Instance().lastFGFrameTime));

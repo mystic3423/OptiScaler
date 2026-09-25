@@ -214,6 +214,131 @@ static void TestMVScale()
     }
 }
 
+static void StoreRows(const XMMATRIX& m, float out[4][4])
+{
+    XMFLOAT4X4 f {};
+    XMStoreFloat4x4(&f, m);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            out[r][c] = f.m[r][c];
+}
+
+static XMMATRIX LoadRows(const float in[4][4])
+{
+    XMFLOAT4X4 f {};
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            f.m[r][c] = in[r][c];
+    return XMLoadFloat4x4(&f);
+}
+
+// Game-style Streamline camera matrices re-expressed per tile must keep their
+// meaning: inverse pairs stay inverse, and clipToPrevClip moves a point to the
+// same tile pixel as projecting the camera-moved point with the tile projection.
+static void TestGameCameraMatricesPerTile()
+{
+    const uint32_t width = 11520;
+    const float height = 2160.0f;
+    const float vfovs[] = { 0.8f, 1.05f };
+    const float yaws[] = { -0.05f, 0.0f, 0.03f }; // per-frame camera turn, radians
+
+    for (float vfov : vfovs)
+    {
+        const XMMATRIX viewToClip = XMMatrixPerspectiveFovRH(vfov, width / height, 0.1f, 10000.0f);
+        const XMMATRIX clipToView = XMMatrixInverse(nullptr, viewToClip);
+
+        for (float yaw : yaws)
+        {
+            // Current view -> previous view: rotate about Y and translate a little
+            const XMMATRIX viewToPrevView = XMMatrixRotationY(yaw) * XMMatrixTranslation(0.2f, -0.1f, 0.3f);
+            const XMMATRIX clipToPrevClip = clipToView * viewToPrevView * viewToClip;
+            const XMMATRIX prevClipToClip = XMMatrixInverse(nullptr, clipToPrevClip);
+
+            float fullV2C[4][4], fullC2V[4][4], fullC2P[4][4], fullP2C[4][4];
+            StoreRows(viewToClip, fullV2C);
+            StoreRows(clipToView, fullC2V);
+            StoreRows(clipToPrevClip, fullC2P);
+            StoreRows(prevClipToClip, fullP2C);
+
+            for (uint32_t t = 0; t < 3; t++)
+            {
+                const auto span = DLSSGTiling::SplitSpan(0, width, 3, t);
+
+                float v2c[4][4], c2v[4][4], c2p[4][4], p2c[4][4], lens[4][4];
+                for (int r = 0; r < 4; r++)
+                {
+                    for (int c = 0; c < 4; c++)
+                    {
+                        v2c[r][c] = fullV2C[r][c];
+                        c2v[r][c] = fullC2V[r][c];
+                        c2p[r][c] = fullC2P[r][c];
+                        p2c[r][c] = fullP2C[r][c];
+                        lens[r][c] = (r == c) ? 1.0f : 0.0f;
+                    }
+                }
+
+                using K = DLSSGTiling::TileMatrixKind;
+                DLSSGTiling::TileMatrix(v2c, K::ViewToClip, width, span.offset, span.size);
+                DLSSGTiling::TileMatrix(c2v, K::ClipToView, width, span.offset, span.size);
+                DLSSGTiling::TileMatrix(c2p, K::ClipToClip, width, span.offset, span.size);
+                DLSSGTiling::TileMatrix(p2c, K::ClipToClip, width, span.offset, span.size);
+                DLSSGTiling::TileMatrix(lens, K::ClipToClip, width, span.offset, span.size);
+
+                // ViewToClip matches the existing projection helper
+                float legacy[4][4];
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++)
+                        legacy[r][c] = fullV2C[r][c];
+                DLSSGTiling::ApplyTileToProjectionRowVector(legacy, width, span.offset, span.size);
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++)
+                        CHECK(std::fabs(legacy[r][c] - v2c[r][c]) < 1e-5f, "viewToClip helper mismatch");
+
+                CHECK(DLSSGTiling::InverseError(v2c, c2v) < 1e-4, "tile %u viewToClip*clipToView err %g", t,
+                      DLSSGTiling::InverseError(v2c, c2v));
+                CHECK(DLSSGTiling::InverseError(c2p, p2c) < 1e-4, "tile %u clipToPrevClip*prevClipToClip err %g", t,
+                      DLSSGTiling::InverseError(c2p, p2c));
+
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++)
+                        CHECK(std::fabs(lens[r][c] - ((r == c) ? 1.0f : 0.0f)) < 1e-6f, "identity lens changed");
+
+                const XMMATRIX tileV2C = LoadRows(v2c);
+                const XMMATRIX tileC2P = LoadRows(c2p);
+
+                for (int ix = -12; ix <= 12; ix++)
+                {
+                    for (int iz = 1; iz <= 4; iz++)
+                    {
+                        const float z = -3.0f * iz;
+                        const XMVECTOR p = XMVectorSet(ix * 0.9f * iz, 0.4f * iz, z, 1.0f);
+
+                        // Through the tile clipToPrevClip
+                        XMFLOAT4 viaMatrix {};
+                        XMStoreFloat4(&viaMatrix, XMVector4Transform(XMVector4Transform(p, tileV2C), tileC2P));
+
+                        // Directly: move the point into the previous view, then project with the tile projection
+                        XMFLOAT4 direct {};
+                        XMStoreFloat4(&direct, XMVector4Transform(XMVector4Transform(p, viewToPrevView), tileV2C));
+
+                        if (std::fabs(direct.w) < 1e-3f)
+                            continue;
+
+                        const double pxMatrix = (viaMatrix.x / viaMatrix.w * 0.5 + 0.5) * span.size;
+                        const double pxDirect = (direct.x / direct.w * 0.5 + 0.5) * span.size;
+                        const double pyMatrix = viaMatrix.y / viaMatrix.w;
+                        const double pyDirect = direct.y / direct.w;
+
+                        CHECK(std::fabs(pxMatrix - pxDirect) < 0.05, "tile %u yaw %f prev x %f vs %f", t, yaw,
+                              pxMatrix, pxDirect);
+                        CHECK(std::fabs(pyMatrix - pyDirect) < 1e-4, "tile %u prev y", t);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main()
 {
     TestTileCount();
@@ -222,6 +347,7 @@ int main()
     TestBoundaryCorrespondence();
     TestProjectionCorrespondence();
     TestMVScale();
+    TestGameCameraMatricesPerTile();
 
     std::printf("%lld checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

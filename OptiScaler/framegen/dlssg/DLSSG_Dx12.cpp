@@ -31,6 +31,33 @@ feature_version DLSSG_Dx12::Version()
 
 HWND DLSSG_Dx12::Hwnd() { return _hwnd; }
 
+static void LogCameraMatrix(const char* label, const sl::float4x4& m)
+{
+    LOG_INFO("  {}: [{:.6g} {:.6g} {:.6g} {:.6g}] [{:.6g} {:.6g} {:.6g} {:.6g}] [{:.6g} {:.6g} {:.6g} {:.6g}] [{:.6g} "
+             "{:.6g} {:.6g} {:.6g}]",
+             label, m.row[0].x, m.row[0].y, m.row[0].z, m.row[0].w, m.row[1].x, m.row[1].y, m.row[1].z, m.row[1].w,
+             m.row[2].x, m.row[2].y, m.row[2].z, m.row[2].w, m.row[3].x, m.row[3].y, m.row[3].z, m.row[3].w);
+}
+
+// Dumps the camera matrices sent to Streamline plus inverse-pair checks, which
+// confirm the row-vector convention holds for the actual game data.
+static void LogCameraConstants(const char* label, const sl::Constants& c)
+{
+    const auto asArray = [](const sl::float4x4& m) { return reinterpret_cast<const float(*)[4]>(&m); };
+
+    LOG_INFO("{}: aspect {:.6g}, fov {:.6g}, pinhole {:.6g},{:.6g}, viewToClip*clipToView err {:.3e}, "
+             "clipToPrevClip*prevClipToClip err {:.3e}",
+             label, c.cameraAspectRatio, c.cameraFOV, c.cameraPinholeOffset.x, c.cameraPinholeOffset.y,
+             DLSSGTiling::InverseError(asArray(c.cameraViewToClip), asArray(c.clipToCameraView)),
+             DLSSGTiling::InverseError(asArray(c.clipToPrevClip), asArray(c.prevClipToClip)));
+
+    LogCameraMatrix("cameraViewToClip", c.cameraViewToClip);
+    LogCameraMatrix("clipToCameraView", c.clipToCameraView);
+    LogCameraMatrix("clipToLensClip", c.clipToLensClip);
+    LogCameraMatrix("clipToPrevClip", c.clipToPrevClip);
+    LogCameraMatrix("prevClipToClip", c.prevClipToClip);
+}
+
 bool DLSSG_Dx12::GetDisplaySize(uint32_t& width, uint32_t& height) const
 {
     const auto& desc = State::Instance().currentSwapchainDesc;
@@ -324,6 +351,7 @@ void DLSSG_Dx12::Deactivate()
         // Viewport 0 always, plus any tile viewports switched on by Dispatch
         TurnOffViewports(0, _lastTileCount > 1 ? _lastTileCount : 1);
         _lastTileCount = 0;
+        _cameraMatrixLogCounter = 0;
 
         sl::ReflexOptions reflexConst = {};
         reflexConst.mode = sl::ReflexMode::eOff;
@@ -551,6 +579,33 @@ bool DLSSG_Dx12::Dispatch()
     constData.cameraNear = _cameraNear[fIndex];
     constData.cameraFar = _cameraFar[fIndex];
 
+    // Prefer the game's own camera matrices over synthesised/empty ones
+    const bool useGameMatrices = DLSSGTiling::UseGameCameraMatrices && _haveCameraMatrices[fIndex];
+
+    if (useGameMatrices)
+    {
+        memcpy(&constData.cameraViewToClip, _cameraViewToClip[fIndex], sizeof(sl::float4x4));
+        memcpy(&constData.clipToCameraView, _clipToCameraView[fIndex], sizeof(sl::float4x4));
+        memcpy(&constData.clipToLensClip, _clipToLensClip[fIndex], sizeof(sl::float4x4));
+        memcpy(&constData.clipToPrevClip, _clipToPrevClip[fIndex], sizeof(sl::float4x4));
+        memcpy(&constData.prevClipToClip, _prevClipToClip[fIndex], sizeof(sl::float4x4));
+        constData.cameraPinholeOffset.x = _cameraPinholeOffset[fIndex][0];
+        constData.cameraPinholeOffset.y = _cameraPinholeOffset[fIndex][1];
+    }
+
+    const int matrixSource = useGameMatrices ? 1 : 0;
+    if (matrixSource != _lastMatrixSource)
+    {
+        LOG_INFO("DLSSG camera matrices: {}", useGameMatrices             ? "game-supplied"
+                                              : haveSynthesizedProjection ? "synthesised from FOV/aspect"
+                                                                          : "not provided");
+        _lastMatrixSource = matrixSource;
+    }
+
+    // Bounded dump: first dispatch after activation and ~240 dispatches later (camera likely moving)
+    const bool logCameraMatrices = _cameraMatrixLogCounter == 0 || _cameraMatrixLogCounter == 240;
+    _cameraMatrixLogCounter++;
+
     constData.jitterOffset.x = _jitterX[fIndex];
     constData.jitterOffset.y = _jitterY[fIndex];
 
@@ -614,6 +669,10 @@ bool DLSSG_Dx12::Dispatch()
         return false;
     }
 
+    if (logCameraMatrices && useGameMatrices)
+        LogCameraConstants(std::format("Full-frame camera (dispatch {})", _cameraMatrixLogCounter - 1).c_str(),
+                           constData);
+
     if (tileCount <= 1)
     {
         auto result = StreamlineProxy::SetConstants()(constData, *frameToken, viewport);
@@ -641,7 +700,22 @@ bool DLSSG_Dx12::Dispatch()
             // Same vertical FOV, tile-wide aspect ratio
             tileConst.cameraAspectRatio = constData.cameraAspectRatio * (float) displaySpan.size / (float) displayWidth;
 
-            if (haveSynthesizedProjection)
+            if (useGameMatrices)
+            {
+                // Re-express the game's matrices in this tile's clip space
+                const auto tileMatrix = [&](sl::float4x4& m, DLSSGTiling::TileMatrixKind kind)
+                {
+                    DLSSGTiling::TileMatrix(reinterpret_cast<float(*)[4]>(&m), kind, displayWidth,
+                                            displaySpan.offset, displaySpan.size);
+                };
+
+                tileMatrix(tileConst.cameraViewToClip, DLSSGTiling::TileMatrixKind::ViewToClip);
+                tileMatrix(tileConst.clipToCameraView, DLSSGTiling::TileMatrixKind::ClipToView);
+                tileMatrix(tileConst.clipToLensClip, DLSSGTiling::TileMatrixKind::ClipToClip);
+                tileMatrix(tileConst.clipToPrevClip, DLSSGTiling::TileMatrixKind::ClipToClip);
+                tileMatrix(tileConst.prevClipToClip, DLSSGTiling::TileMatrixKind::ClipToClip);
+            }
+            else if (haveSynthesizedProjection)
             {
                 XMFLOAT4X4 tileViewToClip = fullViewToClip;
                 DLSSGTiling::ApplyTileToProjectionRowVector(tileViewToClip.m, displayWidth, displaySpan.offset,
@@ -696,6 +770,9 @@ bool DLSSG_Dx12::Dispatch()
 
                 return false;
             }
+
+            if (logCameraMatrices && useGameMatrices)
+                LogCameraConstants(std::format("Tile {} camera", t).c_str(), tileConst);
 
             LOG_DEBUG("Tile {}: backbuffer x {} w {} h {}, mv x {} w {}, mvecScale {}x{}, aspect {}, reset {}", t,
                       displaySpan.offset, displaySpan.size, displayHeight, mvSpan.offset, mvSpan.size,

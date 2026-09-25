@@ -60,6 +60,16 @@ class IFGFeature
     float _cameraRight[BUFFER_COUNT][3] {};    ///< The camera right normalized vector in world space.
     float _cameraForward[BUFFER_COUNT][3] {};  ///< The camera forward normalized vector in world space.
     float _meterFactor[BUFFER_COUNT] = {};
+
+    // Game-supplied camera matrices (Streamline row-major, row-vector convention).
+    // Only the Streamline input provides these; other inputs leave them unset.
+    float _cameraViewToClip[BUFFER_COUNT][4][4] {};
+    float _clipToCameraView[BUFFER_COUNT][4][4] {};
+    float _clipToLensClip[BUFFER_COUNT][4][4] {};
+    float _clipToPrevClip[BUFFER_COUNT][4][4] {};
+    float _prevClipToClip[BUFFER_COUNT][4][4] {};
+    float _cameraPinholeOffset[BUFFER_COUNT][2] {};
+    bool _haveCameraMatrices[BUFFER_COUNT] {};
     double _ftDelta[BUFFER_COUNT] = {};
     UINT64 _interpolationWidth[BUFFER_COUNT] = {};
     UINT _interpolationHeight[BUFFER_COUNT] = {};
@@ -140,6 +150,10 @@ class IFGFeature
                          int index = -1);
     void SetCameraData(float cameraPosition[3], float cameraUp[3], float cameraRight[3], float cameraForward[3],
                        int index = -1);
+    void SetCameraMatrices(const float cameraViewToClip[4][4], const float clipToCameraView[4][4],
+                           const float clipToLensClip[4][4], const float clipToPrevClip[4][4],
+                           const float prevClipToClip[4][4], const float cameraPinholeOffset[2], int index = -1);
+    void ClearCameraMatrices(int index = -1);
     void SetFrameTimeDelta(double delta, int index = -1);
     void SetReset(UINT reset, int index = -1);
     void SetInterpolationRect(UINT64 width, UINT height, int index = -1);

@@ -22,6 +22,11 @@ class DLSSG_Dx12 : public virtual IFGFeature_Dx12
     // Number of viewports switched on by the last successful Dispatch.
     uint32_t _lastTileCount = 0;
 
+    // Camera matrix diagnostics: dispatches since activation, and which matrix
+    // source was used last (-1 unknown, 0 synthesised/empty, 1 game-supplied)
+    uint32_t _cameraMatrixLogCounter = 0;
+    int _lastMatrixSource = -1;
+
     bool GetDisplaySize(uint32_t& width, uint32_t& height) const;
     uint32_t CurrentTileCount() const;
     void TurnOffViewports(uint32_t firstViewport, uint32_t endViewport);

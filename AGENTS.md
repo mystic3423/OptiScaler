@@ -471,6 +471,55 @@ corner-weighted top/bottom band, and native DLSS-G vs OptiScaler DLSSG output
 at 3840x2160 with the same spin. One-off SL warning this session: MV extent
 1280x720 exceeded a 4x4 MV resource (likely a loading-screen placeholder);
 extents are not clamped to resource size.
+Owner then confirmed the top/bottom bands are thickest at the corners, which
+fits the geometry explanation.
+
+### Game camera matrices forwarded to DLSS-G (2026-09-24, in progress)
+
+Owner asked to forward the game's camera matrices; revert point is commit
+`e73212f0` (code as of `41daa8b5`). Direct source edits, uncommitted until the
+owner validates in game.
+
+- `IFGFeature`: per-frame storage for cameraViewToClip, clipToCameraView,
+  clipToLensClip, clipToPrevClip, prevClipToClip and cameraPinholeOffset, plus
+  `SetCameraMatrices`/`ClearCameraMatrices`.
+- `Sl_Inputs_Dx12::setConstants`: stores the game's matrices when finite,
+  non-zero, non-identity projection, not orthographic, not Unreal, and not a
+  game already flagged as sending broken projections (`dontRecalc`);
+  otherwise clears them. Empty clipToLensClip becomes identity. Only the SL2
+  input does this; SL1, FSR-FG and upscaler inputs are unchanged.
+- `DLSSG_Dx12::Dispatch`: uses the game's matrices instead of synthesised or
+  empty ones when present (`DLSSGTiling::UseGameCameraMatrices` switch). Per
+  tile, re-expressed in tile clip space with A = identity except A[0][0] = s,
+  A[3][0] = o: viewToClip * A, A^-1 * clipToView, A^-1 * M * A for
+  clipToPrevClip/prevClipToClip/clipToLensClip. Convention confirmed from the
+  Streamline header: `clipToPrevClip = clipToView * viewToViewPrev *
+  viewToClipPrev` (row vectors).
+- Logging (Info): one line when the matrix source changes; full-frame and
+  per-tile matrix dumps with inverse-pair errors on the first dispatch after
+  activation and again ~240 dispatches later.
+- Tests: `tests/dlssg_tiling_tests.cpp` now 63,659 checks, adding per-tile
+  inverse pairs and clipToPrevClip correspondence under yaw + translation.
+  Release x64 built, no new warnings. Installed to Spider-Man (hash
+  `DBD0F743...16C50C`); previous tiling build kept as
+  `dxgi.dll.before-camera-matrices-20260924-225322.bak`.
+
+Validated (2026-09-24, `OptiScaler_6825612623348.log`, 11520x2160 tiled): owner
+reports the outer-edge band is "so much better": still visible when looking
+hard, but much smaller and not noticeable in normal play. Log: source switches
+to "game-supplied" at FG activation (two frames flip to "not provided" in the
+first ~50 ms while the frame slots fill, then stable). At dispatch 240 the
+game's matrices check out: viewToClip*clipToView error 8.3e-8 full frame and
+8.8e-8 per tile, confirming the row-vector convention on real data. Tile
+projections show s = 3 and o = +2/0/-2 for left/middle/right as expected.
+clipToPrevClip was identity at that sample; whether Spider-Man ever sends
+camera motion there is unknown (the camera may have been still), so the gain is
+at least partly from the projection matrices, which were previously all zero.
+Game projection: [0][0] 0.7357, [1][1] -3.9236, reverse-Z with w = +z, so
+horizontal FOV ~107.5 deg and vertical ~28.6 deg at 48:9 (Vert- behaviour). The
+game reports `cameraFOV` as -0.499 rad (negated). The earlier 4-6x edge-speed
+estimate assumed 50-70 deg vertical FOV and does not apply; with this
+projection the outer edge moves ~2.85x faster than screen centre under yaw.
 
 ## Current RR handoff
 
