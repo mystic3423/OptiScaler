@@ -89,7 +89,8 @@ bool DLSSFeatureDx12::InitDLSS(ID3D12GraphicsCommandList* InCommandList, NVSDK_N
     // Create the direct-output set at nominal integer dimensions. On an
     // uneven first frame this set is retained for later divisible frames;
     // evaluation creates the expanded set and uses the full active input.
-    const unsigned int tileCount = DLSSTiling::TileCountFromEnv();
+    // Keep ordinary-sized outputs on the single-feature path.
+    const unsigned int tileCount = TargetWidth() < 8192 ? 1 : DLSSTiling::TileCountFromEnv();
     _tiles.clear();
     _tileHandles.clear();
 
