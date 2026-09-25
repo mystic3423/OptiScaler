@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DLSSG_Dx12.h"
+#include "DLSSGTiling.h"
 
 #include <hudfix/Hudfix_Dx12.h>
 #include <hudfix/Hudfix_Dx11.h>
@@ -29,6 +30,46 @@ feature_version DLSSG_Dx12::Version()
 }
 
 HWND DLSSG_Dx12::Hwnd() { return _hwnd; }
+
+bool DLSSG_Dx12::GetDisplaySize(uint32_t& width, uint32_t& height) const
+{
+    const auto& desc = State::Instance().currentSwapchainDesc;
+    width = desc.BufferDesc.Width;
+    height = desc.BufferDesc.Height;
+
+    if (width == 0 || height == 0)
+    {
+        width = _width;
+        height = _height;
+    }
+
+    return width != 0 && height != 0;
+}
+
+uint32_t DLSSG_Dx12::CurrentTileCount() const
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    if (!GetDisplaySize(width, height))
+        return 1;
+
+    return DLSSGTiling::TileCountForDisplay(width);
+}
+
+void DLSSG_Dx12::TurnOffViewports(uint32_t firstViewport, uint32_t endViewport)
+{
+    for (uint32_t v = firstViewport; v < endViewport; v++)
+    {
+        sl::DLSSGOptions options {};
+        options.mode = sl::DLSSGMode::eOff;
+        options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
+
+        auto result = StreamlineProxy::DLSSGSetOptions()(sl::ViewportHandle(v), options); // Potential crash point on exit
+        if (result != sl::Result::eOk)
+            LOG_WARN("Couldn't turn off DLSSG for viewport {}, error: {}", v, magic_enum::enum_name(result));
+    }
+}
 
 bool DLSSG_Dx12::CreateSwapchain(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
                                  IDXGISwapChain** swapChain, bool readyToRelease)
@@ -280,10 +321,9 @@ void DLSSG_Dx12::Deactivate()
 
     if (_isActive)
     {
-        sl::DLSSGOptions options {};
-        options.mode = sl::DLSSGMode::eOff;
-        options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockPresentingClientQueue;
-        StreamlineProxy::DLSSGSetOptions()(viewport, options); // Potential crash point on exit
+        // Viewport 0 always, plus any tile viewports switched on by Dispatch
+        TurnOffViewports(0, _lastTileCount > 1 ? _lastTileCount : 1);
+        _lastTileCount = 0;
 
         sl::ReflexOptions reflexConst = {};
         reflexConst.mode = sl::ReflexMode::eOff;
@@ -363,12 +403,35 @@ bool DLSSG_Dx12::Dispatch()
         options.dynamicTargetFrameRate = Config::Instance()->FGDLSSGFramerateTargetDMFG.value_or_default();
     }
 
-    auto dlssgSetOptionsResult = StreamlineProxy::DLSSGSetOptions()(viewport, options);
+    // Split-frame tiling: one Streamline viewport per monitor at Surround widths
+    uint32_t displayWidth = 0;
+    uint32_t displayHeight = 0;
+    GetDisplaySize(displayWidth, displayHeight);
 
-    if (dlssgSetOptionsResult != sl::Result::eOk)
+    const uint32_t tileCount = DLSSGTiling::TileCountForDisplay(displayWidth);
+    const bool tilingTransition = tileCount != _lastTileCount && (tileCount > 1 || _lastTileCount > 1);
+
+    if (tilingTransition)
     {
-        LOG_ERROR("Couldn't set DLSSG options, error: {}", magic_enum::enum_name(dlssgSetOptionsResult));
+        LOG_INFO("DLSSG tiling: {} -> {} viewport(s), display {}x{}", _lastTileCount, tileCount, displayWidth,
+                 displayHeight);
+
+        if (_lastTileCount > tileCount)
+            TurnOffViewports(tileCount, _lastTileCount);
     }
+
+    for (uint32_t t = 0; t < tileCount; t++)
+    {
+        auto dlssgSetOptionsResult = StreamlineProxy::DLSSGSetOptions()(sl::ViewportHandle(t), options);
+
+        if (dlssgSetOptionsResult != sl::Result::eOk)
+        {
+            LOG_ERROR("Couldn't set DLSSG options for viewport {}, error: {}", t,
+                      magic_enum::enum_name(dlssgSetOptionsResult));
+        }
+    }
+
+    _lastTileCount = tileCount;
 
     sl::ReflexOptions reflexConst = {};
     reflexConst.mode = sl::ReflexMode::eLowLatency;
@@ -409,6 +472,10 @@ bool DLSSG_Dx12::Dispatch()
     }
 
     sl::Constants constData = {};
+
+    // Full-frame projection synthesised below, reused to build each tile's projection
+    XMFLOAT4X4 fullViewToClip {};
+    bool haveSynthesizedProjection = false;
 
     if (IsInfiniteDepth() && _cameraFar[fIndex] > _cameraNear[fIndex])
         _cameraFar[fIndex] = std::numeric_limits<float>::infinity();
@@ -453,6 +520,9 @@ bool DLSSG_Dx12::Dispatch()
 
             cameraViewToClip = XMMatrixPerspectiveFovRH(_cameraVFov[fIndex], _cameraAspectRatio[fIndex],
                                                         _cameraNear[fIndex], _cameraFar[fIndex]);
+
+            XMStoreFloat4x4(&fullViewToClip, cameraViewToClip);
+            haveSynthesizedProjection = true;
         }
         else
         {
@@ -484,6 +554,9 @@ bool DLSSG_Dx12::Dispatch()
     constData.jitterOffset.x = _jitterX[fIndex];
     constData.jitterOffset.y = _jitterY[fIndex];
 
+    uint32_t mvLeft = 0;
+    uint32_t mvWidth = 0;
+
     {
         auto mv = GetResource(FG_ResourceType::Velocity, fIndex);
 
@@ -493,6 +566,9 @@ bool DLSSG_Dx12::Dispatch()
 
             return false;
         }
+
+        mvLeft = mv->left;
+        mvWidth = static_cast<uint32_t>(mv->width);
 
         constData.mvecScale.x = _mvScaleX[fIndex] / (float) mv->width;
         constData.mvecScale.y = _mvScaleY[fIndex] / (float) mv->height;
@@ -538,16 +614,94 @@ bool DLSSG_Dx12::Dispatch()
         return false;
     }
 
-    auto result = StreamlineProxy::SetConstants()(constData, *frameToken, viewport);
-    if (result != sl::Result::eOk)
+    if (tileCount <= 1)
     {
-        LOG_ERROR("SetConstants error: {} ({})", magic_enum::enum_name(result), (UINT) result);
+        auto result = StreamlineProxy::SetConstants()(constData, *frameToken, viewport);
+        if (result != sl::Result::eOk)
+        {
+            LOG_ERROR("SetConstants error: {} ({})", magic_enum::enum_name(result), (UINT) result);
 
-        state.fgChanged = true;
-        UpdateTarget();
-        Deactivate();
+            state.fgChanged = true;
+            UpdateTarget();
+            Deactivate();
 
-        return false;
+            return false;
+        }
+    }
+    else
+    {
+        for (uint32_t t = 0; t < tileCount; t++)
+        {
+            const sl::ViewportHandle tileViewport(t);
+            const auto displaySpan = DLSSGTiling::SplitSpan(0, displayWidth, tileCount, t);
+            const auto mvSpan = DLSSGTiling::SplitSpan(mvLeft, mvWidth, tileCount, t);
+
+            sl::Constants tileConst = constData;
+
+            // Same vertical FOV, tile-wide aspect ratio
+            tileConst.cameraAspectRatio = constData.cameraAspectRatio * (float) displaySpan.size / (float) displayWidth;
+
+            if (haveSynthesizedProjection)
+            {
+                XMFLOAT4X4 tileViewToClip = fullViewToClip;
+                DLSSGTiling::ApplyTileToProjectionRowVector(tileViewToClip.m, displayWidth, displaySpan.offset,
+                                                            displaySpan.size);
+
+                XMFLOAT4X4 tileClipToView {};
+                XMStoreFloat4x4(&tileClipToView, XMMatrixInverse(nullptr, XMLoadFloat4x4(&tileViewToClip)));
+
+                memcpy(&tileConst.cameraViewToClip, &tileViewToClip, sizeof(sl::float4x4));
+                memcpy(&tileConst.clipToCameraView, &tileClipToView, sizeof(sl::float4x4));
+            }
+
+            // Pixel displacement is unchanged; only the normalisation extent follows the tile
+            if (DLSSGTiling::MVScaleUsesTileWidth && mvSpan.size > 0)
+                tileConst.mvecScale.x = _mvScaleX[fIndex] / (float) mvSpan.size;
+
+            // Tile histories are not continuous with the full-frame ones
+            if (tilingTransition)
+                tileConst.reset = sl::Boolean::eTrue;
+
+            // Backbuffer tag carries only the subrect this viewport writes
+            sl::ResourceTag backbufferTag {};
+            backbufferTag.resource = nullptr;
+            backbufferTag.type = sl::kBufferTypeBackbuffer;
+            backbufferTag.lifecycle = sl::ResourceLifecycle::eValidUntilPresent;
+            backbufferTag.extent.left = displaySpan.offset;
+            backbufferTag.extent.top = 0;
+            backbufferTag.extent.width = displaySpan.size;
+            backbufferTag.extent.height = displayHeight;
+
+            auto tagResult = StreamlineProxy::SetTagForFrame()(*frameToken, tileViewport, &backbufferTag, 1, nullptr);
+            if (tagResult != sl::Result::eOk)
+            {
+                LOG_ERROR("Tile {} backbuffer extent tag error: {} ({})", t, magic_enum::enum_name(tagResult),
+                          (UINT) tagResult);
+
+                state.fgChanged = true;
+                UpdateTarget();
+                Deactivate();
+
+                return false;
+            }
+
+            auto result = StreamlineProxy::SetConstants()(tileConst, *frameToken, tileViewport);
+            if (result != sl::Result::eOk)
+            {
+                LOG_ERROR("Tile {} SetConstants error: {} ({})", t, magic_enum::enum_name(result), (UINT) result);
+
+                state.fgChanged = true;
+                UpdateTarget();
+                Deactivate();
+
+                return false;
+            }
+
+            LOG_DEBUG("Tile {}: backbuffer x {} w {} h {}, mv x {} w {}, mvecScale {}x{}, aspect {}, reset {}", t,
+                      displaySpan.offset, displaySpan.size, displayHeight, mvSpan.offset, mvSpan.size,
+                      tileConst.mvecScale.x, tileConst.mvecScale.y, tileConst.cameraAspectRatio,
+                      tileConst.reset == sl::Boolean::eTrue);
+        }
     }
 
     LOG_DEBUG("Result: Ok");
@@ -1113,17 +1267,42 @@ bool DLSSG_Dx12::SetResource(Dx12Resource* inputResource)
                 return false;
             }
 
-            auto result = StreamlineProxy::SetTagForFrame()(*frameToken, viewport, &resourceTag, 1, fResource->cmdList);
-            LOG_DEBUG("SetTagForFrame, frameId: {}, type: {} result: {} ({})", frameId, magic_enum::enum_name(type),
-                      magic_enum::enum_name(result), (int32_t) result);
+            // Split-frame tiling: tag the same resource once per viewport, each with
+            // that tile's slice of the resource's own extent (render or display space)
+            const uint32_t tileCount = CurrentTileCount();
 
-            if (result != sl::Result::eOk)
+            if (tileCount > 1 && resourceTag.extent.width == 0)
             {
-                State::Instance().fgChanged = true;
-                UpdateTarget();
-                Deactivate();
-
+                LOG_ERROR("{} has no width, can't split it into {} tiles", magic_enum::enum_name(type), tileCount);
                 return false;
+            }
+
+            for (uint32_t t = 0; t < tileCount; t++)
+            {
+                sl::ResourceTag tileTag = resourceTag;
+
+                if (tileCount > 1)
+                {
+                    const auto span =
+                        DLSSGTiling::SplitSpan(resourceTag.extent.left, resourceTag.extent.width, tileCount, t);
+                    tileTag.extent.left = span.offset;
+                    tileTag.extent.width = span.size;
+                }
+
+                auto result = StreamlineProxy::SetTagForFrame()(*frameToken, sl::ViewportHandle(t), &tileTag, 1,
+                                                                fResource->cmdList);
+                LOG_DEBUG("SetTagForFrame, frameId: {}, viewport: {}, type: {}, extent: {},{} {}x{} result: {} ({})",
+                          frameId, t, magic_enum::enum_name(type), tileTag.extent.left, tileTag.extent.top,
+                          tileTag.extent.width, tileTag.extent.height, magic_enum::enum_name(result), (int32_t) result);
+
+                if (result != sl::Result::eOk)
+                {
+                    State::Instance().fgChanged = true;
+                    UpdateTarget();
+                    Deactivate();
+
+                    return false;
+                }
             }
         }
 

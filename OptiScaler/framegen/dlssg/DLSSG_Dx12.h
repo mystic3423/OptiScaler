@@ -17,6 +17,15 @@ class DLSSG_Dx12 : public virtual IFGFeature_Dx12
     ID3D12Fence* dlssgFence[BUFFER_COUNT] = {};
     UINT64 lastOptionFrame = 0;
 
+    // Split-frame tiling (see DLSSGTiling.h). Viewport i is tile i; viewport 0
+    // doubles as the ordinary full-frame viewport when not tiled.
+    // Number of viewports switched on by the last successful Dispatch.
+    uint32_t _lastTileCount = 0;
+
+    bool GetDisplaySize(uint32_t& width, uint32_t& height) const;
+    uint32_t CurrentTileCount() const;
+    void TurnOffViewports(uint32_t firstViewport, uint32_t endViewport);
+
     bool Dispatch();
 
   protected:

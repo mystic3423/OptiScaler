@@ -5,20 +5,458 @@ at **11520 x 2160**, using three 4K monitors in NVIDIA Surround. Read this
 context before proposing changes to the tiling implementation. This is an
 experimental workaround with working game builds, not a finished general solution.
 
-## Branch separation (owner instruction, 2026-09-19)
+## Branch separation (owner instruction, 2026-09-19; updated 2026-09-21)
 
 - `dlss-tiling` is the separate DLSS Super Resolution work.
 - `dlss-rr-tiling` is the experimental Ray Reconstruction work split from it.
   The owner also refers to this as the Ray Regeneration work; this branch's
   current implementation targets NVIDIA RR, not AMD Ray Regeneration.
-- Keep these efforts separate until RR works correctly. Always inspect the
-  current branch and working tree; do not assume RR changes or test results
+- `dlss-fg-tiling` is the current branch, split from `dlss-rr-tiling` so its
+  git history and this file's RR narrative stayed available as reference. Its
+  actual source was then reset to match `dlss-tiling` exactly (no RR code is
+  present); only this AGENTS.md and `docs/investigations/cyberpunk-ray-reconstruction.md`
+  retain the RR content. This branch's own focus is Frame Generation (FG), not RR.
+  Unlike RR, which fully replaces the SR path (its DLUnified backend does its own
+  upscaling), FG runs downstream of and in tandem with SR/RR: it takes the already
+  upscaled/composited frame plus depth, motion vectors and HUD-less color, and
+  synthesizes extra interpolated frames to raise displayed FPS without changing
+  output resolution. The SR tiling problem (working around DLSS's output-width
+  limit) and the FG problem (whether FG itself needs tiling, and whether tiling a
+  temporal algorithm is even sound) are different problems; do not assume findings
+  from SR/RR tiling transfer to FG without checking the reasoning in each case.
+- Keep these efforts separate until each works correctly. Always inspect the
+  current branch and working tree; do not assume RR or FG changes or test results
   apply to `dlss-tiling`, and do not merge/backport experiments automatically.
-- The isolated input/output copy path is a temporary diagnostic, explicitly
+- The isolated input/output copy path (RR-specific) is a temporary diagnostic, explicitly
   not intended for the final implementation. Source edits are direct, not patches.
 - Branch-independent reminder: `../AGENTS.md` (OptiScaler-only section).
 
+## Current FG focus (this branch, 2026-09-21)
+
+No FG source changes have been made yet; this is a feasibility assessment only,
+requested by the owner before any implementation. Findings below are from reading
+this fork's existing `OptiScaler/framegen/` code and bundled FidelityFX-SDK source,
+not from GPU testing or an external reference implementation of tiled FG.
+
+- OptiScaler already supports multiple FG backends: native NVIDIA DLSS-G (routed
+  through Streamline, `framegen/dlssg/DLSSG_Dx12.*`), AMD FSR3 frame interpolation
+  (open-source FidelityFX-SDK, `framegen/ffx/FSRFG_Dx12.*`), Intel XeFG
+  (`framegen/xefg/XeFG_Dx12.*`), and several NVNGX-facing proxy/compat shims under
+  `framegen/nvngx/`. They share a common `IFGFeature`/`IFGFeature_Dx12` interface.
+- DLSS-G's real work happens inside NVIDIA's closed Streamline plugin
+  (`sl.dlss_g`), bound to a single swapchain viewport via `sl::ViewportHandle`, and
+  is understood to use dedicated Optical Flow Accelerator (OFA) hardware on the
+  full frame. This is architecturally unlike SR/RR, where OptiScaler itself calls
+  `NVSDK_NGX_D3D12_CreateFeature`/`EvaluateFeature` per handle, which is what made
+  creating three independent per-tile handles possible. There is no equivalent
+  per-region handle creation exposed for DLSS-G; tiling it the way SR/RR were
+  tiled does not look possible at the application level. Whether native DLSS-G
+  even hits a width-style limit at 11520 has not been tested.
+- FSR3's frame interpolation is open source and shader-based (already vendored
+  under `external/FidelityFX-SDK` and `OptiScaler/include/fsr3*`), so it is at
+  least inspectable/modifiable, unlike DLSS-G. But its optical-flow and
+  interpolation/inpainting passes (`ffx_frameinterpolation_optical_flow_vector_field.h`,
+  `ffx_frameinterpolation_game_motion_vector_field.h`,
+  `ffx_frameinterpolation_compute_inpainting_pyramid.h`) already use a single
+  `InterpolationRectBase()`/`InterpolationRectSize()` concept, but that exists for
+  letterboxing/UI-safe-area purposes (see `IFGFeature::SetInterpolationRect`
+  usages), not for splitting one frame into independently processed regions.
+  Motion estimation performs mip-pyramid block matching across the whole frame;
+  naively running it three times on independent horizontal tiles would very likely
+  reproduce or worsen the cross-boundary motion problems already seen in the RR
+  tiling investigation (an object's flow vector needs source pixels outside its
+  own tile once it approaches a tile edge), and frame interpolation is a temporal,
+  whole-image synthesis rather than SR/RR's local per-pixel spatial resampling, so
+  seam artifacts would likely be more visible, not less.
+- Importantly, by the time FG would run, SR tiling has already produced one
+  seamless composited 11520x2160 frame (the real swapchain back buffer). FG
+  backends are not known to have the same internal per-feature width-limit check
+  that motivated SR/RR tiling in the first place; that check appears specific to
+  `NVSDK_NGX_D3D12_CreateFeature` for DLSS/DLSSD. So the open question is not only
+  "can FG be tiled" but "does FG even need tiling at 11520 wide," which is untested.
+- Recommended first experiment (not yet done): try running FSR3 FG and/or DLSS-G
+  untiled against the already-tiled SR composited output at 11520x2160, and see
+  whether creation/evaluation succeeds or fails the way full-frame RR did before
+  tiling was needed. If it succeeds untiled, no FG tiling work is needed at all.
+  If it fails with something width-shaped, a full-frame-once-optical-flow +
+  tiled-reconstruction hybrid (compute flow globally, only tile the final
+  reconstruction/output write) is a more promising direction than three fully
+  independent per-tile FG passes, but would still be a substantially larger
+  undertaking than SR/RR tiling given FG's temporal, whole-frame nature and its
+  tie-in to Present-time frame pacing/Reflex signaling.
+
+### DLSS-G viewport/subrect finding (2026-09-21, from the real Streamline guide)
+
+The owner asked whether NVIDIA's own developer docs had been checked; the
+assessment above was code-only. Fetched and byte-verified (via `curl`, not just
+an AI summary) NVIDIA-RTX/Streamline's `docs/ProgrammingGuideDLSS_G.md`
+(`main` branch, matches the vendored `external/streamline` headers' API shapes).
+This meaningfully updates the earlier "no per-region handle exists" conclusion:
+
+- Section 5.3 "MULTIPLE VIEWPORTS": "DLSS-G supports multiple viewports.
+  Resources for each viewport must be tagged independently... Input resources
+  may differ between viewports, but all viewports write to the same back
+  buffer." Each viewport is tagged via its own `slSetTagForFrame()` calls, using
+  `sl::ViewportHandle`, matching the header found locally at
+  `external/streamline/sl_dlss_g.h` (`slDLSSGSetOptions`/`slDLSSGGetState` both
+  take a `viewport` parameter).
+- Section 5.0/5.2 documents a `sl::Extent` subrect explicitly for the backbuffer
+  tag: `sl::Extent backBufferSubrectInfo {128, 128, 512, 512}; // backbuffer
+  subrect info to run FG on.` `sl::ResourceTag` (in
+  `external/streamline/sl_core_types.h`) carries this same `Extent` for any
+  tagged resource. This is conceptually the same per-region subrect idea that
+  made SR/RR tiling possible via NGX, but expressed through Streamline's tagging
+  API instead of NGX's per-handle Width/Height/subrect-base parameters.
+- Section 4.0 "HANDLE MULTIPLE SWAP-CHAINS" is unrelated to this idea: it is
+  about DLSS-G attaching to only one of several swap chains an app/editor may
+  create (e.g. editor viewports), not about spanning one swap chain across
+  multiple outputs.
+- No maximum-resolution limit is documented anywhere in the guide (checked for
+  8192/16384-style width caps and found none); only a documented minimum
+  (`sl::DLSSGSettings::minWidthOrHeight`, undocumented numeric value, exposed as
+  `DLSSGStatus::eFailResolutionTooLow`). This further supports trying DLSS-G
+  untiled at 11520 wide before assuming any width-driven failure.
+- What the guide does NOT discuss anywhere: split-screen use, cross-viewport
+  motion continuity, or how multiple viewports' independently-interpolated
+  regions are expected to compose seamlessly at their shared boundary within one
+  back buffer. The absence of guidance here is the same shape of risk already
+  raised for FSR3 above (each viewport's optical flow only sees its own tagged
+  extent), just now with a documented, sanctioned API surface for attempting it
+  rather than no surface at all.
+
+Owner plan (2026-09-21): test FG directly in a game against the existing SR
+tiling fix before any FG-specific source work. Untested; nothing implemented.
+
+Build/install for this test (2026-09-21): Release x64 built successfully via
+MSBuild (existing C4250 dominance and LNK4098/LNK4744 warnings only, zero
+errors; the documented missing-packaging-copy-path message still appears and
+was not investigated further). No source changes were made; this is the plain
+`dlss-tiling`-equivalent code already on this branch, with no FG-specific
+changes. Installed to
+`C:\Program Files (x86)\Steam\steamapps\common\Marvel's Spider-Man
+Remastered\` (game was closed; no `Spider-Man.exe`/`crs-*` processes running
+at install time). Built and installed `dxgi.dll`/`OptiScaler.dll` hashes match:
+`DACB80CBB0D295AC922F9B713168BCCA72F07E1243C6DA3D121A1A404A6F839B`. Previous
+installed DLL backed up beside the game as
+`dxgi.dll.before-fg-tiling-build-20260921-211604.bak`.
+
+Set the game's existing `OptiScaler.ini` `LogToFile = true` and `LogLevel = 0`
+(Trace); both were previously `auto` (`LogToFile` auto resolves to false, so
+logging was effectively off despite `LogLevel` auto already meaning Trace).
+No other ini keys were touched, so existing tuned settings (FG backend choice,
+tiling options, etc.) are preserved. Previous ini backed up as
+`OptiScaler.ini.before-fg-tiling-trace-logging-20260921-211604.bak`. Owner can
+now launch and test FG; each session will write a new timestamped
+`OptiScaler_<n>.log` (SingleFile was already false) at Trace level beside the
+game exe.
+
+Owner report: FG "looks like it does run" in Spider-Man Remastered with the
+existing SR tiling fix. This confirms basic activation/execution, not image
+quality; seam/ghosting behavior at the tile boundaries and any Trace-log detail
+have not yet been reviewed by the agent. Owner is moving on to test a second
+game next; which game was not yet specified at this note's time.
+
+Second game (2026-09-21): Avatar: Frontiers of Pandora ("AFOP"), installed at
+`C:\Program Files (x86)\Ubisoft\Ubisoft Game Launcher\games\AFOP`. Owner had
+already copied the same build's `dxgi.dll` there themselves (hash-verified by
+the agent to match the Spider-Man build,
+`DACB80CB...A6F839B`); this game also ships `nvngx_dlssd.dll` (RR), unlike
+Spider-Man. Owner explicitly requested no backup this time. Set only
+`LogToFile = true` and `LogLevel = 0` (Trace) in the existing tuned
+`OptiScaler.ini`, same as the Spider-Man change; no other keys touched, no
+backup taken. Game was not running at the time of the edit. Owner test pending.
+
+AFOP FSR3-FG crash (2026-09-21): owner enabled FSR3 frame generation by
+accident (meant to test native DLSS-G) while using DLSS SR (not RR) for
+upscaling, and the game crashed. `OptiScaler.log` (this game uses a single
+fixed filename, not the timestamped-per-session pattern; SingleFile is
+presumably true here) shows normal-looking operation up to the crash: DLSS SR
+evaluate calls at Render 5875x1102 -> Target/Display 11520x2160 (OptiHandle
+1000000; the log's evaluate line does not distinguish per-tile native handles,
+so this does not by itself confirm or rule out 3-tile SR routing), then FSR3 FG
+context creation (`CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12`
+then `CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION`, both `result: 0` success), then
+two full successful `DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE`/
+`DISPATCH_DESC_TYPE_FRAMEGENERATION` cycles. The log then ends immediately
+after a third `DISPATCH_DESC_TYPE_FRAMEGENERATION` dispatch call, with no
+further lines, no logged error, and no graceful-shutdown message: consistent
+with a hard crash during/after that GPU dispatch, not an OptiScaler-detected
+failure path.
+
+Windows Application event log (`Get-WinEvent` "Application Error" provider)
+confirms two separate crash reports, both: faulting module `afop.exe` itself
+(the game's own executable, not `dxgi.dll`/`OptiScaler.dll`, not
+`amd_fidelityfx_framegeneration_dx12.dll`, not an NVIDIA driver module),
+exception code `0xc0000005` (access violation), and the *same* fault offset
+`0x000000000162b730` in both occurrences. Two independent crashes at the exact
+same unsymbolized address suggest a reproducible fault, not random corruption,
+but the agent has no symbols for `afop.exe` to resolve that offset to source;
+whether the game is faulting on a resource that FSR3 FG/tiling produced in a
+shape it didn't expect, or something unrelated to this fork's changes, is not
+established. No FSR3/dispatch-level error was logged before the crash, so if
+this is tiling-related the failure mode is silent corruption rather than a
+loud rejection (unlike NGX's `0xBAD0000D`-style creation failures).
+
+Since this used FSR3 FG (accidental) rather than the native DLSS-G the owner
+actually intends to evaluate for this branch, this result should not be read
+as a verdict on DLSS-G's viewport/subrect approach discussed above. It is a
+real data point that untiled FSR3 FG did not survive multiple frames against
+this fork's 11520-wide tiled SR output in this game, which is still relevant
+background if FSR3 FG tiling is ever revisited. Owner intends to retry with
+DLSS-G explicitly selected instead.
+
+Recovery (2026-09-21): owner reported the game now crashes before the title
+screen whenever FG is enabled, so the in-game overlay is unreachable to turn it
+off. The unchanged `OptiScaler.log` mtime/content confirms newer launch
+attempts crashed too early to log anything new (or before Logger init).
+`[FrameGen]` `FGInput`/`FGOutput` were still `auto` in the ini (the earlier
+crash was likely the *game's own native* FSR3 FG request, which OptiScaler's
+FFX API hooks intercept regardless of `[FrameGen] Enabled`, so that key alone
+may not have been the actual gate). Force-disabled via direct source-confirmed
+kill switch (`Config.cpp`/`dllmain.cpp` honor `FGOutput=NoFG`/`FGInput=NoFG` as
+an explicit override, not just "no OptiScaler-injected FG"): set
+`[FrameGen] Enabled = false`, `FGInput = nofg`, `FGOutput = nofg` (previously
+all `auto`). No backup taken, matching the owner's earlier no-backup request
+for this game/session. Owner should retry launching now; if it still crashes,
+the trigger is likely upstream of OptiScaler (e.g. the game's own native
+FSR3 FG toggle persisted in its own settings, outside OptiScaler.ini) and the
+game's own graphics settings file would need to be located and reset instead.
+
+Correction (2026-09-21): owner clarified the crash was always the game itself
+crashing (matches the earlier Windows Application-error finding: faulting
+module `afop.exe`, not `dxgi.dll`/`OptiScaler.dll`/the FFX DLL), not something
+OptiScaler's own `[FrameGen]` gate controlled. Found the real switch:
+`C:\Users\brand\Documents\My Games\AFOP\graphic settings.cfg`, a small Lua-like
+table the game itself writes, `Video.frameGeneration = 1` with
+`frameGenerationMode = 0` (FSR, matching the owner's "the fsr one by
+accident"), `rayReconstruction = false` (matches "using DLSS SR not RR").
+Changed only `frameGeneration` from `1` to `0`; nothing else in the file was
+touched. The file also carries a `hash = -320276597` field (likely a
+content-integrity check the game computes over the rest of the table); its
+algorithm is unknown to the agent, so this edit was not re-hashed. If the game
+rejects the file as corrupted it will likely reset to a default preset
+(playable again, but the owner's other tuned graphics settings would be lost)
+rather than fail to launch; this was not verified before reporting. Owner
+should relaunch to confirm; if a hash mismatch resets other settings, those
+would need retuning separately from this fork's code.
+
+Spider-Man DLSS-G not loading (2026-09-21/23): with OptiScaler FGInput/FGOutput
+= DLSSG, trace logs show Streamline 2.4.0 `Ignoring plugin 'sl.dlss_g' since it
+is was not requested by the host`, then `Can't init StreamlineProxy, disabling
+FGOutput`. The game decides at Streamline init which features to request, so an
+in-game toggle after startup cannot fix that launch. Owner also reports a 4K
+no-OptiScaler control did not work. As of 2026-09-23 the folder holds the stock
+pairing again: `nvngx_dlssg.dll` 3.7.0 with all `sl.*` at 2.4.0 (the swapped
+DLL is no longer present); `nvngx_dlss.dll` is 310.9.1. HAGS is on; driver
+reports 32.0.16.1656. Community reports (Steam threads) say DLSS FG only appears
+after selecting DLSS Super Resolution and restarting the game. Swapping only
+`nvngx_dlssg.dll` in Streamline games risks a version mismatch with the old
+`sl.*` runtime. The NVIDIA App's Enhanced FG preset list does not include
+Spider-Man Remastered. Not verified by the agent in-game.
+
+Width gate ported (2026-09-23, owner request): applied only the SR
+`TargetWidth() < 8192 ? 1 : DLSSTiling::TileCountFromEnv()` change from
+`dlss-rr-tiling` commit a83312ab to `DLSSFeature_Dx11.cpp` and
+`DLSSFeature_Dx12.cpp` (the commit also holds RR code, so it was not
+cherry-picked whole). Both files now match `dlss-rr-tiling` byte-for-byte.
+Outputs narrower than 8192 use ordinary single-feature DLSS for A/B comparison.
+Release x64 built with exit code 0; packaged `dxgi.dll` SHA256
+`3D5E823162274EA139F34E1CB9BEBB1E9B446F174DED095572641A2473873C6B`.
+Installed to Spider-Man Remastered on 2026-09-23 as `dxgi.dll` and
+`OptiScaler.dll`; both hashes match the build. No `dxgi.dll` was present
+beforehand because the owner had renamed the previous build to `dxgi.dll.bak`
+for the no-OptiScaler 4K test, so no new backup was taken. Not yet tested in-game.
+
+OptiScaler DLSSG output setup (2026-09-23): the owner's Spider-Man ini has
+`FGInput = DLSSG` and `FGOutput = DLSSG`. That output makes OptiScaler load its
+own Streamline from `<game dir>\streamline\` (`Streamline_Proxy.h`), which did
+not exist, so it showed "Can't init DLSSG Output / Are you missing the
+streamline folder?" and disabled FG. This fork's Release packaging does not
+ship Streamline files. Created that folder from NVIDIA's official
+`streamline-sdk-v2.14.1.zip` GitHub release, production `bin/x64` files only:
+`sl.interposer`, `sl.common`, `sl.dlss_g`, `sl.reflex`, `sl.pcl`, `sl.dlss`
+(all 2.14.1.0) and `nvngx_dlssg.dll` 310.9.1.0. All are Authenticode-valid,
+signed by NVIDIA Corporation. The SDK's `nvngx_dlssg.dll` is byte-identical to
+the one DLSS Swapper put in the game folder. The game's own `sl.*` files stay
+at 2.4.0 and were not touched. The repo headers are Streamline 2.11.1.
+
+First run (2026-09-23, `OptiScaler_5949955483943.log`, 3840x2160): the width
+gate works; DLSS SR ran single-feature at 1280x720 -> 3840x2160 with no
+"Tiled DLSS" line. OptiScaler's own DLSS-G (SL 2.14.1 from `streamline\`)
+activated at 22:37:18 and dispatched about 20k times with `Result: Ok`, 2x.
+Owner says the NVIDIA overlay changed to look like Preset B in another game,
+and reports a lot of tearing in the middle of the screen. Log facts: NVCP
+VSync "Force ON" is overriding the app and SL's RSYNC reports VSync enabled;
+the game presents with SyncInterval 0 plus ALLOW_TEARING. The game's own SL
+2.4.0 logged 9,822 times that it supports one swap chain and is skipping
+Present hooks on the second one, so two Streamline runtimes are in the process.
+Reflex frame IDs jumped from ~2982 to ~5.93e18 right as FG activated. SL
+warned once that camera matrices (cameraViewToClip, clipToPrevClip, etc.) are
+invalid and once that no backbuffer extent was given. Cause of the tearing is
+not established. Suggested A/B: FGInput/FGOutput off so the game's native
+DLSS-G runs through OptiScaler, same scene.
+
+Streamline 1 ruled out (2026-09-23): the owner asked whether Spider-Man is an
+unsupported SL1 game. It is not. The upstream wiki's SL1 list (Witcher 3,
+Dying Light 2, Returnal, A Plague Tale Requiem, etc.) does not include it, and
+the log shows the game's `sl.interposer.dll` is Streamline 2.4.0, hooked as v2.
+The wiki recommends the DLSSG-via-SL input for games with native DLSS-FG.
+Stronger proof than the list: every Spider-Man log shows the game's slInit
+reporting `host SDK v2.4.0`, meaning the game itself was built against the
+Streamline 2.4.0 SDK. The game's own wiki page lists "DLSSG via SL ->
+FSR-FG/XeFG" as working, tested only on AMD GPUs with OptiScaler 0.9; it does
+not list the DLSSG output this setup uses.
+
+Wider search (2026-09-23): no public report was found of DLSSG input -> DLSSG
+output on NVIDIA, and nothing on tearing with the DLSSG output. Closest leads:
+upstream issue #1094 (Starfield, AMD): with DLSSG input + FSR-FG output, the
+game's native DLSS-G also ran, causing latency, swapchain recreation and
+crashes; a local patch blocked native `slSetFeatureLoaded(kFeatureDLSS_G)`.
+Spider-Man does not show that: in the last three logs the game's SL 2.4.0 skips
+`sl.dlss_g` and only OptiScaler's SL 2.14.1 loads it. The dlss-unlocked
+project ships SL 2.14.1 in `OptiScaler/streamline/` for the DLSSG output on
+NVIDIA; its issue #35 (RTX 4070) reports FG frames not improving smoothness and
+was closed with no documented fix. Upstream #1087 notes DLSSG-via-SL -> FSR-FG
+hitting FPS limits, suspected to be the FSR-FG swapchain.
+Overlay "Current DLSSG state: OFF" (2026-09-23): display quirk, not FG off.
+The label reads `State::dlssgDetectedInterpolationCount`, set only in
+`NVNGX_DLSS_Dx12.cpp` when an NGX `NVSDK_NGX_Feature_FrameGeneration` evaluate
+passes through OptiScaler's NGX hook (reads `DLSSG.MultiFrameCount`). With the
+DLSSG output, OptiScaler's own SL 2.14.1 calls the driver's NGX directly, so
+the hook never sees it. `OptiScaler_5966058486324.log` shows 0 such evals but
+14,758 `DLSSG_Dx12::Dispatch Result: Ok`, and "Streamline FG state: ON".
+HUD hypothesis (2026-09-23): FSR-FG input showed the same artifact; owner
+reverted to DLSSG input/output. Owner reports "Show Detected UI" tints scene
+elements, not just HUD, and suspects FG is misreading HUD inputs rather than
+bad pacing. That toggle (`shaders/hudless_compare`) tints pixels where the
+game's hudless texture and the final back buffer differ by more than 0.003 per
+channel (`HC_Dx12.cpp`), below one 8-bit step, so post effects after the
+hudless capture can also tint. `OptiScaler_5977347793960.log`: one hudless and
+one UI texture per frame; the second hudless SetResource each frame is inside
+OptiScaler's own Dispatch with the same texture. The game reports hudless and
+UIColorAndAlpha with frameId 0 (SL 2.4 style). Unverified which is the cause.
+Owner follow-up: lowering OptiScaler's Reflex FPS limit from the VRR
+calculator's 116 to 114 seemed better, with "Disable UI texture" still
+unchecked. Early impression only. Owner paused this investigation on
+2026-09-23 to play for longer sessions and separate pacing tearing from
+bad-input artifacts.
+Planned next test (owner suggestion, mimic FSR-only games): in-game frame
+generation set to FSR 3.1, OptiScaler `FGInput = fsrfg`, `FGOutput = DLSSG`.
+The ini was not edited because the game was running. Applied later the same
+day with the game closed: `FGInput` changed from `DLSSG` to `fsrfg`,
+`FGOutput = DLSSG` unchanged. Owner must pick FSR frame generation in game.
+
+Net effect: multi-viewport DLSS-G tiling is not ruled out at the API level the
+way it looked before this check, and Streamline explicitly supports the
+mechanics (multiple viewports, per-resource Extent, shared backbuffer). Whether
+it avoids the cross-tile ghosting the RR investigation fought for weeks remains
+untested and undocumented either way. This is still meaningfully cheaper to
+prototype than reworking FSR3's open-source shaders, since it only requires
+driving an already-supported public API three times with different extents,
+rather than modifying FidelityFX's optical-flow/inpainting passes. It should be
+tried after (not before) the plain "does untiled FG work at 11520 wide at all"
+experiment above, since if untiled DLSS-G already works, none of this is needed.
+
+### FG tiling implementation (2026-09-24, owner request)
+
+Owner asked to implement FG tiling now. Direct source edits, no patch. Untiled
+DLSS-G at 11520 wide has still not been tested, so tiling is not yet proven
+necessary; `DLSSGTiling::EnableTiling = false` restores the single-viewport
+path at every width for an A/B comparison (rebuild required).
+
+Scope: only OptiScaler's own DLSS-G output (`FGOutput = DLSSG`,
+`framegen/dlssg/DLSSG_Dx12.*`). FSR-FG and XeFG outputs, and the game's own
+native DLSS-G, are unchanged.
+
+- New `OptiScaler/framegen/dlssg/DLSSGTiling.h` (added to the project/filters):
+  `TileCountForDisplay` (3 tiles when display width >= 8192, same rule as the
+  SR gate), `SplitSpan` (contiguous, gap-free proportional split; uneven widths
+  differ by at most one pixel), `ApplyTileToProjectionRowVector` (same
+  off-center tile projection formula as the RR work), and debug constants
+  `EnableTiling` and `MVScaleUsesTileWidth`.
+- `DLSSG_Dx12::Dispatch`: at >= 8192, turns on Streamline viewports 0..2 with
+  identical DLSS-G options; per viewport it tags the backbuffer with only that
+  monitor's subrect (null resource, `kBufferTypeBackbuffer`, extent
+  x = 0/3840/7680, w 3840 at 11520) and sets its own constants: tile aspect
+  ratio, tile-local off-center `cameraViewToClip`/`clipToCameraView` when
+  OptiScaler synthesises the projection, and `mvecScale.x` normalised to the
+  tile's MV extent width (pixel displacement unchanged). Reset is forced on
+  single <-> tiled transitions; unused viewports are turned off. Below 8192
+  the code makes the same calls as before on viewport 0.
+- `DLSSG_Dx12::SetResource`: each depth/MV/hudless/UI tag is sent once per
+  viewport with that tile's slice of the resource's own extent (render-space
+  for depth/low-res MVs, display-space for hudless/UI).
+- `Deactivate` turns off every viewport that Dispatch enabled.
+
+Assumptions and risks (not validated): Streamline normalises MVs relative to
+the tagged extent (flip `MVScaleUsesTileWidth` if motion is 3x off on tiles);
+DLSS-G honours nonzero extent origins (the RR work found NGX RR did not for
+direct subrect inputs; tile 0's zero origin could hide such a bug again); a
+null-resource backbuffer tag with no command list is accepted; hudless/UI
+extents match the backbuffer tile only when the game's hudless covers the
+full frame from x = 0. Each tile has independent optical flow and history, so
+seams or ghosting at monitor boundaries are expected risks. The SL guide does
+not document cross-viewport continuity.
+
+Validation: `tests/dlssg_tiling_tests.cpp` (build command in its header)
+passes 59,447 CPU checks: tile-count gate, split coverage for widths 0-12000,
+known layouts (11520, 3840, AFOP's 5875), render/display boundary agreement
+within half a pixel, projection correspondence for three tiles (x shifts by the
+tile origin, y/z/w unchanged). Existing SR suite still passes 81,910 cases.
+Release x64 built with zero errors and no warnings in the DLSSG files; packaged
+`dxgi.dll` SHA256 `51FB0E94AB96A01D57DD90B2E070DF962D90751AA914E1E329FE3620E9A68217`.
+Installed to Spider-Man Remastered on 2026-09-24 (game closed); installed
+`dxgi.dll`/`OptiScaler.dll` hashes match the build. Previous width-gate build
+(`3D5E8231...`) backed up beside the game as
+`dxgi.dll.before-fg-tiling-20260924-164652.bak`. Game ini has FGInput/FGOutput
+= DLSSG, LogToFile true, LogLevel auto (resolves to Trace); the `streamline`
+folder is present. No in-game or GPU testing by the agent yet. Useful log
+markers: `DLSSG tiling: 0 -> 3 viewport(s)`, per-tile `Tile N: backbuffer x`
+lines, and `SetTagForFrame ... viewport: N ... extent:`.
+
+First in-game run (2026-09-24, `OptiScaler_6674985597610.log`, 11520x2160,
+Ultra Performance 3840x720): owner reports tiled FG "seemed to work fine",
+apart from the tearing already seen before tiling. Log confirms SR tiling (3
+tiles) and `DLSSG tiling: 0 -> 3 viewport(s)` twice; per-tile lines show
+backbuffer x 0/3840/7680 w 3840, MV x 0/1280/2560 w 1280, tile aspect 1.778.
+The game crashed after the owner changed several settings. Streamline 2.14.1
+caught an exception at 18:50:57.522 and wrote
+`C:\ProgramData\NVIDIA\Streamline\Spider-Man\1790290257521211\sl-sha-98614dad6.dmp`.
+cdb on that dump: access violation (read 0xCAF8) in `nvwgf2umx.dll` (NVIDIA D3D
+driver) inside `ID3D12GraphicsCommandList::ResourceBarrier`, called from
+OptiScaler's SL `sl.common` via `slSetTagForFrame`, from OptiScaler's
+`dxgi.dll`, on the game's render thread. The log shows it was the HUD-less tag
+for viewport 0 (tile 0), frame 9983, sent from the game's own tag call with the
+game's command list; it later returned `eErrorExceptionHandler`. OptiScaler
+then deactivated and reactivated FG, and rendering froze. No Windows
+Application Error or driver-reset event was logged. The same viewport-0 tag
+call exists without tiling, so tiling is not established as the cause; the
+settings changes (missing depth/MV tags at 18:50:38-39) are another candidate.
+Logging volume: 72 MB in ~6.5 min at Trace. Tiling adds ~9% (per-tile Dispatch
+lines plus three SetTagForFrame lines per tag, all Debug level).
+
+Tearing solved (2026-09-24): it was a VSync ownership conflict, not tiling and
+not the HUD inputs. `OptiScaler_6681961633265.log` showed OptiScaler's
+`[V-Sync] ForceVsync = true` setting SyncInterval 1 and stripping
+DXGI_PRESENT_ALLOW_TEARING on all 6,755 presents, while Streamline logged
+`NVCPL 'Force OFF' overriding app VSync request - VSync disabled` and
+`DRS VSync mode is Force OFF`, with `fullscreen iFlip` flipping 0/1. Owner set
+the NVIDIA app to "Use the 3D application setting" and kept VSync on in
+OptiScaler; tearing is gone and the owner reports tiled FG "looks so good now".
+Record this pairing: driver on app-controlled, VSync forced in OptiScaler. The
+earlier suspects (Reflex frame-ID jumps, hudless/UI inputs, the "Show Detected
+UI" pink tint, the 114 vs 116 cap) did not fix it and were not the cause,
+though the 114 cap helping is consistent with a VRR-range effect. Tiled DLSS-G
+at 11520x2160 is therefore owner-confirmed working for image quality; seam
+behaviour over long sessions and the 18:50 crash remain open.
+
 ## Current RR handoff
+
+Note (2026-09-21): everything from here through the end of this file describes
+`dlss-rr-tiling`'s history and is retained on `dlss-fg-tiling` as background
+context only. None of this RR source exists in this branch's working tree
+(it was reset to `dlss-tiling`); do not assume any RR file path, flag or
+handoff state mentioned below is present here.
 
 Exact known-good restoration (2026-09-21, owner request): installed and packaged
 DLLs are the saved BFA0510A binary, SHA256
@@ -83,8 +521,9 @@ Input sizes must follow the game's active render dimensions. These examples
 are not the only intended sizes. SR tiling covers DX11/DX12. Experimental DX12
 RR tiling was added on 2026-09-19; the owner reports the isolated-copy reference
 eliminates major ghosting/grain/duplicate images, with minor surface/smoke artifacts
-remaining. Direct-output optimization is under test. DX11/Vulkan RR and Frame
-Generation tiling are not implemented.
+remaining. Direct-output optimization is under test. DX11/Vulkan RR tiling is
+not implemented. On `dlss-fg-tiling`, experimental DLSS-G tiling exists for
+OptiScaler's own DLSSG output only (see "FG tiling implementation" above).
 
 ## Current implementation and decisions
 
