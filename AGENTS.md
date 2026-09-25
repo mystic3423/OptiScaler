@@ -450,6 +450,28 @@ though the 114 cap helping is consistent with a VRR-range effect. Tiled DLSS-G
 at 11520x2160 is therefore owner-confirmed working for image quality; seam
 behaviour over long sessions and the 18:50 crash remain open.
 
+Outer-edge band (2026-09-24, owner report, assessment only): during fast yaw a
+band along the left edge of the left monitor and right edge of the right
+monitor is not interpolated cleanly, ending in a visible vertical line; same
+width on both sides, thinner bands at top/bottom; something similar but milder
+at 3840x2160. Leading hypothesis: normal FG screen-edge disocclusion, amplified
+by the 48:9 perspective. Under yaw, screen-space speed in tan units is
+omega * (1 + x^2); the outer Surround edge sits at x = tan(vfov/2) * 48/9
+versus 16/9 for a 4K edge, so the outer edges move roughly 4-6x faster for
+vertical FOVs of 50-70 degrees, and yaw also creates vertical motion near the
+outer corners. An MV-scale error would affect whole tiles, not just outer
+edges. Monitor seams sit at the same x as a 4K edge, so a seam band like the
+4K edge band would indicate tiles are not sharing context; not yet reported.
+Also found: OptiScaler's DLSSG output never forwards the game's own camera
+matrices (`clipToPrevClip`, `cameraViewToClip`, etc.); `Sl_Inputs_Dx12` reads
+the projection only for near/far, and `DLSSG_Dx12::Dispatch` leaves matrices
+zero when the game supplies camera vectors. The game's native DLSS-G receives
+them. Whether that affects the edge band is unknown. Suggested checks: seams,
+corner-weighted top/bottom band, and native DLSS-G vs OptiScaler DLSSG output
+at 3840x2160 with the same spin. One-off SL warning this session: MV extent
+1280x720 exceeded a 4x4 MV resource (likely a loading-screen placeholder);
+extents are not clamped to resource size.
+
 ## Current RR handoff
 
 Note (2026-09-21): everything from here through the end of this file describes
